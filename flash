@@ -1,0 +1,137 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# PlatformIO, however this machine prefers to get it. A Mac with Homebrew was
+# never the only way to own one of these boards.
+if ! command -v pio >/dev/null 2>&1; then
+  # An earlier install may be there without being on PATH.
+  for candidate in "$HOME/.platformio/penv/bin/pio" "$HOME/.local/bin/pio"; do
+    if [[ -x "$candidate" ]]; then
+      PATH="$(dirname "$candidate"):$PATH"
+      break
+    fi
+  done
+fi
+
+if ! command -v pio >/dev/null 2>&1; then
+  if [[ "$(uname -s)" == "Darwin" ]] && command -v brew >/dev/null 2>&1; then
+    echo "Installing PlatformIO with Homebrew..."
+    brew install platformio
+  elif command -v pipx >/dev/null 2>&1; then
+    echo "Installing PlatformIO with pipx..."
+    pipx install platformio
+  elif command -v python3 >/dev/null 2>&1; then
+    echo "Installing PlatformIO for this user with pip..."
+    python3 -m pip install --user --upgrade platformio
+    PATH="$HOME/.local/bin:$PATH"
+  else
+    echo "PlatformIO is required: https://platformio.org/install/cli"
+    echo "Install it once, then run ./flash again."
+    exit 1
+  fi
+fi
+
+if ! command -v pio >/dev/null 2>&1; then
+  echo "PlatformIO installed but is not on PATH. Open a new terminal and run"
+  echo "./flash again, or see https://platformio.org/install/cli"
+  exit 1
+fi
+
+# Linux ships no udev rule for these boards by default, and the failure it
+# produces is a permission error at the very end of a long build.
+if [[ "$(uname -s)" == "Linux" && ! -e /etc/udev/rules.d/99-platformio-udev.rules ]]; then
+  echo "Note: on Linux the board needs udev rules and your user in the dialout"
+  echo "group, or the upload fails with a permission error. See"
+  echo "https://docs.platformio.org/en/latest/core/installation/udev-rules.html"
+  echo
+fi
+
+api_url="${GLOSSARAY_API_URL:-}"
+device_token="${GLOSSARAY_DEVICE_TOKEN:-}"
+if [[ -z "$api_url" ]]; then
+  printf 'Glossaray server URL (https://...): '
+  IFS= read -r api_url
+fi
+if [[ -z "$device_token" ]]; then
+  printf 'Device token: '
+  IFS= read -rs device_token
+  printf '\n'
+fi
+
+if [[ ! "$api_url" =~ ^https://[^/]+/?$ ]]; then
+  echo "Enter the HTTPS origin only, for example https://glossaray.example.com"
+  exit 1
+fi
+if [[ ${#device_token} -lt 32 ]]; then
+  echo "The device token is missing or too short."
+  exit 1
+fi
+
+if ! command -v curl >/dev/null 2>&1; then
+  echo "curl is required to verify the server before flashing."
+  exit 1
+fi
+
+api_url="${api_url%/}"
+echo "Checking Glossaray server and device token..."
+health_status="$(curl -sS --http1.1 --max-time 15 -o /dev/null -w '%{http_code}' \
+  "$api_url/healthz")" || {
+  echo "Could not reach $api_url. Nothing was flashed."
+  exit 1
+}
+if [[ "$health_status" != "200" ]]; then
+  echo "Glossaray health check returned HTTP $health_status. Nothing was flashed."
+  exit 1
+fi
+
+# An authenticated ordinary GET reaches the WebSocket route but cannot upgrade:
+# 426 proves the credential was admitted; 403 means the token is wrong. This
+# checks the exact device credential without opening a billable/provider session.
+auth_status="$(curl -sS --http1.1 --max-time 15 -o /dev/null -w '%{http_code}' \
+  -H "Authorization: Bearer $device_token" "$api_url/ws")" || {
+  echo "Could not verify the device token. Nothing was flashed."
+  exit 1
+}
+if [[ "$auth_status" != "426" ]]; then
+  echo "Device authentication check returned HTTP $auth_status. Nothing was flashed."
+  exit 1
+fi
+echo "Server and device token passed."
+
+echo
+pio device list
+echo
+confirmed="${GLOSSARAY_FLASH_CONFIRM:-}"
+if [[ -z "$confirmed" ]]; then
+  printf 'This replaces firmware on the connected supported board. Continue? [y/N] '
+  IFS= read -r confirmed
+fi
+[[ "$confirmed" == "y" || "$confirmed" == "Y" ]] || exit 0
+
+upload_args=(--target upload)
+if [[ -n "${GLOSSARAY_UPLOAD_PORT:-}" ]]; then
+  upload_args+=(--upload-port "$GLOSSARAY_UPLOAD_PORT")
+fi
+
+if command -v shasum >/dev/null 2>&1; then
+  provisioning_revision="$(printf '%s\n%s' "$api_url" "$device_token" | shasum -a 256)"
+else
+  provisioning_revision="$(printf '%s\n%s' "$api_url" "$device_token" | sha256sum)"
+fi
+provisioning_revision="${provisioning_revision%% *}"
+build_log="$(mktemp "${TMPDIR:-/tmp}/glossaray-flash.XXXXXX")"
+trap 'rm -f "$build_log"' EXIT
+GLOSSARAY_API_URL="${api_url%/}" \
+GLOSSARAY_DEVICE_TOKEN="$device_token" \
+GLOSSARAY_PROVISIONING_REVISION="$provisioning_revision" \
+  pio run "${upload_args[@]}" >"$build_log" 2>&1 || {
+    echo "Build or upload failed. Last output:"
+    tail -80 "$build_log"
+    exit 1
+  }
+tail -20 "$build_log"
+
+echo
+echo "Flashed successfully. Saved Wi-Fi and device settings were preserved."
+echo "This flash will apply $api_url once at boot; later setup changes still persist."
+echo "Press RESET once if the display remains blank."
